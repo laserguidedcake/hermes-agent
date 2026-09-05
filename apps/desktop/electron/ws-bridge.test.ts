@@ -41,6 +41,7 @@ function makeSender(label: string) {
     label,
     sent,
     destroyed: false,
+    get destroyedListenerCount() { return (listeners.get('destroyed') ?? []).length },
     isDestroyed() { return this.destroyed },
     send(_channel: string, token: string, payload: unknown) { sent.push({ token, payload }) },
     once(event: string, fn: () => void) { (listeners.get(event) ?? listeners.set(event, []).get(event)!).push(fn) },
@@ -135,29 +136,70 @@ test('send/close enforce WebContents ownership; owner destruction retires its so
   assert.deepEqual(handlers.get('hermes:ws-bridge:send')!({ sender: a }, 'tok-a', 'y', false), { ok: false })
 })
 
-test('cancel before open is never promoted — even when ws opens late', async () => {
+test('cancel settles the original open IPC invoke with a terminal receipt', async () => {
   const { handlers, ipc } = makeFakeIpc()
   const { instances, FakeWs } = makeWsFactory()
   const bridge = createWebSocketBridge({ ipc, webSocketImpl: FakeWs as never })
   bridge.install()
 
   const sender = makeSender('a')
-  void (handlers.get('hermes:ws-bridge:open')!({ sender }, 'wss://gw.example/api/ws', 'tok-c') as Promise<unknown>)
+  const openP = handlers.get('hermes:ws-bridge:open')!({ sender }, 'wss://gw.example/api/ws', 'tok-settle') as Promise<{ ok: boolean; error?: string }>
 
-  // Renderer connect timeout fires: cancel the pending dial
-  assert.deepEqual(handlers.get('hermes:ws-bridge:cancel')!({ sender }, 'tok-c'), { ok: true })
+  assert.deepEqual(handlers.get('hermes:ws-bridge:cancel')!({ sender }, 'tok-settle'), { ok: true })
+  // The open invoke must publish its terminal settlement, not hang forever.
+  const result = await openP
+  assert.equal(result.ok, false)
+  assert.equal(bridge.pendingDials.size, 0)
+  assert.equal(bridge.sockets.size, 0)
   assert.equal(instances[0].terminated, true)
 
-  // Underlying ws opens late anyway — must not be promoted, must be terminated
-  instances[0].readyState = 0
+  // A late underlying open can neither promote nor double-settle.
   instances[0].terminated = false
+  instances[0].readyState = 0
   instances[0].simulateOpen()
   await nextTick()
   assert.equal(bridge.sockets.size, 0)
   assert.equal(instances[0].terminated, true)
+})
 
-  // Nothing addressable under the token
-  assert.deepEqual(handlers.get('hermes:ws-bridge:send')!({ sender }, 'tok-c', 'x', false), { ok: false })
+test('owner destruction settles a pending dial with a terminal receipt', async () => {
+  const { handlers, ipc } = makeFakeIpc()
+  const { instances, FakeWs } = makeWsFactory()
+  const bridge = createWebSocketBridge({ ipc, webSocketImpl: FakeWs as never })
+  bridge.install()
+
+  const sender = makeSender('a')
+  const openP = handlers.get('hermes:ws-bridge:open')!({ sender }, 'wss://gw.example/api/ws', 'tok-orphan') as Promise<{ ok: boolean; error?: string }>
+
+  sender.destroy()
+  const result = await openP
+  assert.equal(result.ok, false)
+  assert.equal(bridge.pendingDials.size, 0)
+  assert.equal(bridge.sockets.size, 0)
+  assert.equal(instances[0].terminated, true)
+
+  // Late open after teardown cannot promote.
+  instances[0].terminated = false
+  instances[0].readyState = 0
+  instances[0].simulateOpen()
+  await nextTick()
+  assert.equal(bridge.sockets.size, 0)
+  assert.equal(instances[0].terminated, true)
+})
+
+test('repeated dials from one sender register a single destroyed listener', async () => {
+  const { handlers, ipc } = makeFakeIpc()
+  const { instances, FakeWs } = makeWsFactory()
+  createWebSocketBridge({ ipc, webSocketImpl: FakeWs as never }).install()
+
+  const sender = makeSender('a')
+  for (let i = 0; i < 3; i++) {
+    void (handlers.get('hermes:ws-bridge:open')!({ sender }, 'wss://gw.example/api/ws', `tok-loop-${i}`) as Promise<unknown>)
+    instances[i].simulateOpen()
+    await nextTick()
+  }
+  // watchSender dedupes via WeakSet: exactly one destroyed hook per WebContents.
+  assert.equal(sender.destroyedListenerCount, 1)
 })
 
 test('cancel from a non-owner sender is refused', async () => {

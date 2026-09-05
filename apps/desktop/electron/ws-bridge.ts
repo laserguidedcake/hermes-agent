@@ -43,8 +43,11 @@ interface PendingDial {
   ws: WebSocketLike
   sender: WebContents
   token: string
-  canceled: boolean
   watchdog: ReturnType<typeof setTimeout>
+  /** The open IPC promise's resolver — settlement is a first-class,
+   *  idempotent operation owned by finalizeDial(). */
+  settle: (result: { ok: boolean; error?: string }) => void
+  settled: boolean
 }
 
 export interface WsLike {
@@ -89,11 +92,30 @@ export function createWebSocketBridge(deps: WebSocketBridgeDeps = {}) {
 
   const sockets = new Map<string, LiveSocket>()
   const pendingDials = new Map<string, PendingDial>()
+  // One destroyed-listener per WebContents, not per dial — a long-lived
+  // renderer that reconnects repeatedly must not accumulate listeners.
+  const retiredSenders = new WeakSet<WebContents>()
 
   const sendTo = (sender: WebContents, token: string, payload: unknown) => {
     if (!sender.isDestroyed()) {
       sender.send(CHANNEL_EVENT, token, payload)
     }
+  }
+
+  /** Single-owner, idempotent terminal settlement for a pending dial: clears
+   *  the watchdog, removes the pending entry, settles the open IPC result
+   *  exactly once, and terminates the transport. Every terminal path (open,
+   *  cancel, owner destruction, watchdog expiry, pre-open close) goes through
+   *  here — a canceled/settled token can never be promoted or double-settled. */
+  const finalizeDial = (token: string, result: { ok: boolean; error?: string }): PendingDial | null => {
+    const dial = pendingDials.get(token)
+    if (!dial || dial.settled) return null
+    dial.settled = true
+    clearTimeout(dial.watchdog)
+    pendingDials.delete(token)
+    try { dial.ws.terminate() } catch { /* already gone */ }
+    dial.settle(result)
+    return dial
   }
 
   const retireOwned = (sender: WebContents) => {
@@ -103,92 +125,90 @@ export function createWebSocketBridge(deps: WebSocketBridgeDeps = {}) {
         try { entry.ws.terminate() } catch { /* already gone */ }
       }
     }
-    for (const [token, dial] of pendingDials) {
+    for (const [token, dial] of [...pendingDials]) {
       if (dial.sender === sender) {
-        dial.canceled = true
-        clearTimeout(dial.watchdog)
-        pendingDials.delete(token)
-        try { dial.ws.terminate() } catch { /* already gone */ }
+        finalizeDial(token, { ok: false, error: 'Renderer destroyed during connect' })
       }
     }
   }
 
-  function install(): void {
-    ipc.handle('hermes:ws-bridge:open', (event, url: string, token: string) => {
-      return new Promise(resolve => {
-        const sender = event.sender
-        if (typeof token !== 'string' || token.length === 0 || pendingDials.has(token) || sockets.has(token)) {
-          resolve({ ok: false, error: 'invalid dial token' })
-          return
-        }
-        let ws: WebSocketLike
-        try {
-          ws = new WsImpl(url, {
-            headers: headersForUrl(url),
-            maxPayload: 64 * 1024 * 1024
-          })
-        } catch (err) {
-          resolve({ ok: false, error: String(err) })
-          return
-        }
+  const watchSender = (sender: WebContents) => {
+    if (retiredSenders.has(sender)) return
+    retiredSenders.add(sender)
+    sender.once('destroyed', () => retireOwned(sender))
+  }
 
-        const dial: PendingDial = {
+  function install(): void {
+    ipc.handle('hermes:ws-bridge:open', (event, url: string, token: string): Promise<{ ok: boolean; error?: string }> => {
+      const sender = event.sender
+      if (typeof token !== 'string' || token.length === 0 || pendingDials.has(token) || sockets.has(token)) {
+        return Promise.resolve({ ok: false, error: 'invalid dial token' })
+      }
+      let ws: WebSocketLike
+      try {
+        ws = new WsImpl(url, {
+          headers: headersForUrl(url),
+          maxPayload: 64 * 1024 * 1024
+        })
+      } catch (err) {
+        return Promise.resolve({ ok: false, error: String(err) })
+      }
+
+      let dial: PendingDial
+      const openPromise = new Promise<{ ok: boolean; error?: string }>(resolve => {
+        dial = {
           ws,
           sender,
           token,
-          canceled: false,
+          settled: false,
+          settle: resolve,
           watchdog: setTimeout(() => {
-            if (pendingDials.delete(token)) {
-              dial.canceled = true
-              try { ws.terminate() } catch { /* already gone */ }
-              resolve({ ok: false, error: 'WebSocket connect timed out' })
-            }
+            finalizeDial(token, { ok: false, error: 'WebSocket connect timed out' })
           }, connectTimeoutMs)
         }
-        pendingDials.set(token, dial)
-
-        sender.once('destroyed', () => retireOwned(sender))
-
-        ws.on('open', () => {
-          if (dial.canceled || !pendingDials.delete(token)) {
-            // Renderer gave up before the dial completed — never promote.
-            try { ws.terminate() } catch { /* already gone */ }
-            return
-          }
-          clearTimeout(dial.watchdog)
-          sockets.set(token, { ws, sender })
-          // Resolve BEFORE emitting open, and defer the open event past the
-          // renderer's promise microtask so its bookkeeping lands first —
-          // either race alone hangs the client in 'connecting' forever.
-          resolve({ ok: true })
-          setImmediate(() => sendTo(sender, token, { type: 'open' }))
-        })
-        ws.on('message', (data: Buffer | string, isBinary: boolean) => {
-          sendTo(sender, token, { type: 'message', data: isBinary ? data.toString('base64') : String(data), binary: isBinary })
-        })
-        ws.on('error', (err: Error) => {
-          sendTo(sender, token, { type: 'error', message: err.message })
-        })
-        ws.on('close', (code: number, reason: Buffer) => {
-          clearTimeout(dial.watchdog)
-          const wasPending = pendingDials.delete(token)
-          sockets.delete(token)
-          sendTo(sender, token, { type: 'close', code, reason: reason.toString() })
-          if (wasPending && !dial.canceled) {
-            resolve({ ok: false, error: `WebSocket closed during connect (code ${code})` })
-          }
-        })
       })
+      pendingDials.set(token, dial!)
+      watchSender(sender)
+
+      ws.on('open', () => {
+        if (!pendingDials.has(token)) {
+          // Already settled (cancel/timeout/teardown) — never promote.
+          try { ws.terminate() } catch { /* already gone */ }
+          return
+        }
+        const d = finalizeDial(token, { ok: true })
+        if (!d) {
+          try { ws.terminate() } catch { /* already gone */ }
+          return
+        }
+        sockets.set(token, { ws, sender })
+        // Resolve happened in finalizeDial; emit open deferred past the
+        // renderer's promise microtask so its bookkeeping lands first —
+        // either race alone hangs the client in 'connecting' forever.
+        setImmediate(() => sendTo(sender, token, { type: 'open' }))
+      })
+      ws.on('message', (data: Buffer | string, isBinary: boolean) => {
+        sendTo(sender, token, { type: 'message', data: isBinary ? data.toString('base64') : String(data), binary: isBinary })
+      })
+      ws.on('error', (err: Error) => {
+        sendTo(sender, token, { type: 'error', message: err.message })
+      })
+      ws.on('close', (code: number, reason: Buffer) => {
+        sockets.delete(token)
+        sendTo(sender, token, { type: 'close', code, reason: reason.toString() })
+        finalizeDial(token, { ok: false, error: `WebSocket closed during connect (code ${code})` })
+      })
+
+      return openPromise
     })
 
     // Cancel a CONNECTING dial (renderer connect timeout fired before open).
+    // Settlement flows through finalizeDial, so the original open IPC invoke
+    // receives its terminal receipt ({ ok: false }) instead of hanging forever.
     ipc.handle('hermes:ws-bridge:cancel', (event, token: string) => {
       const dial = pendingDials.get(token)
       if (!dial || dial.sender !== event.sender) return { ok: false }
-      dial.canceled = true
-      clearTimeout(dial.watchdog)
-      pendingDials.delete(token)
-      try { dial.ws.terminate() } catch { /* already gone */ }
+      finalizeDial(token, { ok: false, error: 'Dial canceled by renderer' })
       return { ok: true }
     })
 
