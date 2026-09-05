@@ -187,7 +187,6 @@ export function createWebSocketBridge(deps: WebSocketBridgeDeps = {}) {
           return
         }
         sockets.set(token, { ws, sender })
-        console.log(`[ws-bridge] open token=${token}`)
         // Resolve happened in finalizeDial; emit open deferred past the
         // renderer's promise microtask so its bookkeeping lands first —
         // either race alone hangs the client in 'connecting' forever.
@@ -197,11 +196,9 @@ export function createWebSocketBridge(deps: WebSocketBridgeDeps = {}) {
         sendTo(sender, token, { type: 'message', data: isBinary ? data.toString('base64') : String(data), binary: isBinary })
       })
       ws.on('error', (err: Error) => {
-        console.log(`[ws-bridge] error token=${token}: ${err.message}`)
         sendTo(sender, token, { type: 'error', message: err.message })
       })
       ws.on('close', (code: number, reason: Buffer) => {
-        console.log(`[ws-bridge] close token=${token} code=${code} reason=${reason.toString()}`)
         sockets.delete(token)
         sendTo(sender, token, { type: 'close', code, reason: reason.toString() })
         finalizeDial(token, { ok: false, error: `WebSocket closed during connect (code ${code})` })
