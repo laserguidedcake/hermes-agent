@@ -104,16 +104,21 @@ export function createWebSocketBridge(deps: WebSocketBridgeDeps = {}) {
 
   /** Single-owner, idempotent terminal settlement for a pending dial: clears
    *  the watchdog, removes the pending entry, settles the open IPC result
-   *  exactly once, and terminates the transport. Every terminal path (open,
-   *  cancel, owner destruction, watchdog expiry, pre-open close) goes through
-   *  here — a canceled/settled token can never be promoted or double-settled. */
+   *  exactly once, and — on FAILURE — terminates the transport. Every
+   *  terminal path (open, cancel, owner destruction, watchdog expiry,
+   *  pre-open close) goes through here — a canceled/settled token can never
+   *  be promoted or double-settled. A successful settlement must NOT
+   *  terminate: the socket moves to the live map (v3.1 bug: unconditional
+   *  terminate killed every dial 6ms after open — the "flapping" loop). */
   const finalizeDial = (token: string, result: { ok: boolean; error?: string }): PendingDial | null => {
     const dial = pendingDials.get(token)
     if (!dial || dial.settled) return null
     dial.settled = true
     clearTimeout(dial.watchdog)
     pendingDials.delete(token)
-    try { dial.ws.terminate() } catch { /* already gone */ }
+    if (!result.ok) {
+      try { dial.ws.terminate() } catch { /* already gone */ }
+    }
     dial.settle(result)
     return dial
   }
@@ -182,6 +187,7 @@ export function createWebSocketBridge(deps: WebSocketBridgeDeps = {}) {
           return
         }
         sockets.set(token, { ws, sender })
+        console.log(`[ws-bridge] open token=${token}`)
         // Resolve happened in finalizeDial; emit open deferred past the
         // renderer's promise microtask so its bookkeeping lands first —
         // either race alone hangs the client in 'connecting' forever.
@@ -191,9 +197,11 @@ export function createWebSocketBridge(deps: WebSocketBridgeDeps = {}) {
         sendTo(sender, token, { type: 'message', data: isBinary ? data.toString('base64') : String(data), binary: isBinary })
       })
       ws.on('error', (err: Error) => {
+        console.log(`[ws-bridge] error token=${token}: ${err.message}`)
         sendTo(sender, token, { type: 'error', message: err.message })
       })
       ws.on('close', (code: number, reason: Buffer) => {
+        console.log(`[ws-bridge] close token=${token} code=${code} reason=${reason.toString()}`)
         sockets.delete(token)
         sendTo(sender, token, { type: 'close', code, reason: reason.toString() })
         finalizeDial(token, { ok: false, error: `WebSocket closed during connect (code ${code})` })
