@@ -599,6 +599,7 @@ import {
   writeGpuStackCookieMarker
 } from './windows-stack-cookie-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
+import { installWebSocketBridge } from './ws-bridge'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -18487,6 +18488,10 @@ app.whenReady().then(() => {
     rememberLog(`[updates] post-update relaunch detected (from ${relaunchInfo.fromVersion})`)
   }
 
+  // Remote gateway WebSockets dial from the main process via the `ws` package
+  // (node:tls honors NODE_EXTRA_CA_CERTS) because Chromium's renderer WS pool
+  // ignores --use-system-certificates and undici ignores NODE_EXTRA_CA_CERTS.
+  installWebSocketBridge()
   // Warm the login-shell PATH resolution immediately so it usually completes
   // before the backend start path awaits the same single-flight promise.
   void ensureLoginShellPath()
