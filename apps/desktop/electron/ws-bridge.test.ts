@@ -136,6 +136,24 @@ test('send/close enforce WebContents ownership; owner destruction retires its so
   assert.deepEqual(handlers.get('hermes:ws-bridge:send')!({ sender: a }, 'tok-a', 'y', false), { ok: false })
 })
 
+test('successful open does NOT terminate the socket (live socket stays usable)', async () => {
+  const { handlers, ipc } = makeFakeIpc()
+  const { instances, FakeWs } = makeWsFactory()
+  const bridge = createWebSocketBridge({ ipc, webSocketImpl: FakeWs as never })
+  bridge.install()
+
+  const sender = makeSender('a')
+  const openP = handlers.get('hermes:ws-bridge:open')!({ sender }, 'wss://gw.example/api/ws', 'tok-live') as Promise<{ ok: boolean }>
+  instances[0].simulateOpen()
+  assert.deepEqual(await openP, { ok: true })
+
+  // finalizeDial must not terminate on success — the socket is live traffic now.
+  assert.equal(instances[0].terminated, false)
+  assert.equal(bridge.sockets.size, 1)
+  assert.deepEqual(handlers.get('hermes:ws-bridge:send')!({ sender }, 'tok-live', 'ping', false), { ok: true })
+  assert.deepEqual(instances[0].sent, ['ping'])
+})
+
 test('cancel settles the original open IPC invoke with a terminal receipt', async () => {
   const { handlers, ipc } = makeFakeIpc()
   const { instances, FakeWs } = makeWsFactory()
