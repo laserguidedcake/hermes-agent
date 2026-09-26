@@ -56,7 +56,7 @@ function makeBridgeApi() {
     api,
     calls,
     listeners,
-    resolveOpen: (token: string, result = { ok: true }) => pendingOpens.get(token)!(result),
+    resolveOpen: (token: string, result: { ok: boolean; error?: string } = { ok: true }) => pendingOpens.get(token)!(result),
     emit: (token: string, payload: { type: string; data?: string; code?: number; reason?: string }) => {
       for (const cb of [...listeners]) cb(token, payload)
     }
