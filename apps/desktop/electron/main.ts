@@ -600,6 +600,7 @@ import {
 } from './windows-stack-cookie-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { installWebSocketBridge } from './ws-bridge'
+import { applyPrivateCaTrustFallback } from './private-ca-trust'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -7235,6 +7236,7 @@ function getOauthSession() {
 
   oauthSession = session.fromPartition(OAUTH_SESSION_PARTITION)
   installRemoteHeaderRulesOnSession(oauthSession)
+  applyPrivateCaTrustFallback(oauthSession)
 
   return oauthSession
 }
@@ -7276,6 +7278,7 @@ function getOauthSessionForUrl(url) {
     sess = session.fromPartition(partition)
     oauthSessionsByPartition.set(partition, sess)
     installRemoteHeaderRulesOnSession(sess)
+    applyPrivateCaTrustFallback(sess)
   }
 
   return sess
@@ -18494,6 +18497,10 @@ app.whenReady().then(() => {
   // Header resolution is the same main-owned store the renderer webRequest
   // path uses, so per-connection headers survive the transport move.
   installWebSocketBridge({ headersForUrl: headersForRemoteRequest })
+  // Chromium's verifier (net requests, OAuth sessions, page loads) ignores
+  // NODE_EXTRA_CA_CERTS — fall back to node:tls verification for hosts it
+  // rejects, so private-CA remotes work outside the WS bridge too.
+  applyPrivateCaTrustFallback(session.defaultSession)
   // Warm the login-shell PATH resolution immediately so it usually completes
   // before the backend start path awaits the same single-flight promise.
   void ensureLoginShellPath()
