@@ -10,8 +10,16 @@ import { map, type MapStore } from 'nanostores'
 
 import type { HermesApiRequest } from '@/global'
 
+import { gatewaySocketFactory } from '@/api/ws-bridge-socket'
 import { CanonicalDesktopProtocol, canonicalProfile, canonicalPromptParams, canonicalSessionKey, openGatewaySocket, recordCanonicalOwner, splitRewindSubmit } from './canonical-protocol'
 import { DialReadiness, GATEWAY_NOT_CONNECTED_MESSAGE, remainingRequestBudget } from './dial-readiness'
+
+// A local gateway's native dial carries a one-use ticket that becomes a gateway
+// subprotocol, so that path keeps main's ticketed WebSocket. Every other dial goes
+// through the bridge factory (private-CA and Local Network Access origins).
+function openGatewaySocketForGateway(url: string): WebSocket {
+  return new URL(url).searchParams.has('native_dial') ? openGatewaySocket(url) : gatewaySocketFactory(url)
+}
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
 // model info/options, cron) the moment the backend passes readiness. On a
@@ -585,7 +593,7 @@ export class HermesGateway extends JsonRpcGatewayClient {
       onUnhandledRequest: request =>
         console.warn(`[gateway] Hermes Desktop has no server-request registry for ${request.method} (${request.id})`),
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS,
-      socketFactory: openGatewaySocket
+      socketFactory: openGatewaySocketForGateway
     })
     // The wire follows the peer's explicit advertisement, read before any subscriber runs; a
     // native dial is canonical by provenance.
