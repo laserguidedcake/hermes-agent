@@ -8,9 +8,9 @@ import {
 } from '@hermes/shared'
 import { map, type MapStore } from 'nanostores'
 
+import { gatewaySocketFactory } from '@/api/ws-bridge-socket'
 import type { HermesApiRequest } from '@/global'
 
-import { gatewaySocketFactory } from '@/api/ws-bridge-socket'
 import { CanonicalDesktopProtocol, canonicalProfile, canonicalPromptParams, canonicalSessionKey, openGatewaySocket, recordCanonicalOwner, splitRewindSubmit } from './canonical-protocol'
 import { DialReadiness, GATEWAY_NOT_CONNECTED_MESSAGE, remainingRequestBudget } from './dial-readiness'
 
